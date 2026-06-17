@@ -1,0 +1,11 @@
+state/
+log/
+worktrees/
+issues/*.prompt
+__pycache__/
+*.pyc
+.venv/
+.sdd/
+.remember/
+*.design.md
+review-*.md
