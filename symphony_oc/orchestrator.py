@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Optional
 
 from symphony_oc.config import load_config
-from symphony_oc.state import Run, schedule_retry, mark_failed, load_running, save_run_atomic
+from symphony_oc.state import Run, schedule_retry, mark_failed, load_all, load_running, save_run_atomic
 from symphony_oc.subproc import interrupt_process
 from symphony_oc.executor import dispatch
 from symphony_oc.reconciler import reconcile
@@ -95,9 +95,6 @@ def _re_dispatch(run: Run) -> None:
     run.error = None
 
 
-from pathlib import Path
-
-
 def cleanup_orphans(runs: list[Run], stall_timeout_ms: int = 1_800_000,
                     worktree_root: str = "./worktrees") -> list[tuple[str, str]]:
     """Detect and handle orphan/stale processes.
@@ -128,18 +125,48 @@ def cleanup_orphans(runs: list[Run], stall_timeout_ms: int = 1_800_000,
 
 
 def _pid_exists_simple(pid: int | None) -> bool:
-    """Check if a process with the given PID exists, without signal overhead."""
+    """Check if a process with the given PID exists, without signal overhead.
+
+    Also reaps child zombie processes via waitpid, so that completed
+    agents are properly detected as dead rather than lingering as defunct.
+    """
     if pid is None or pid <= 0:
         return False
     try:
         import os
+        # Try to reap child zombie first
+        reaped, _ = os.waitpid(pid, os.WNOHANG)
+        if reaped == pid:
+            return False  # Successfully reaped, process is gone
+        # waitpid returned (0, 0) — still running, confirm with kill
         os.kill(pid, 0)
         return True
+    except ChildProcessError:
+        return False  # Not our child or already reaped
     except (OSError, ProcessLookupError):
         return False
 
 
 logger = logging.getLogger("symphony-oc")
+
+
+def process_completed(runs: list[Run], cfg) -> None:
+    """Detect completed agents (dead PID, status running) and reconcile.
+
+    If the agent process has exited and the run is still marked as running,
+    attempt the reconcile cycle (CI, push, PR). The run is updated in-place.
+    """
+    for run in runs:
+        if run.status != "running":
+            continue
+        if _pid_exists_simple(run.pid):
+            continue
+        logger.info("agent completed: %s (pid %s)", run.issue_id, run.pid)
+        try:
+            reconcile(run, cfg)
+        except Exception as e:
+            logger.exception("reconcile failed for %s: %s", run.issue_id, e)
+            schedule_retry(run, f"reconcile error: {e}", backoff_ms=retry_delay(run.attempt))
 
 
 def main_loop(cfg) -> None:
@@ -166,6 +193,7 @@ def main_loop(cfg) -> None:
                             runs.append(new_run)
                             logger.info("dispatched %s", issue.id)
                 check_stalls(runs, cfg.agent.stall_timeout_ms)
+                process_completed(runs, cfg)
                 process_retry_queue(runs, cfg.agent.max_retries)
                 save_run_atomic(str(state_path), runs)
         except Exception as e:

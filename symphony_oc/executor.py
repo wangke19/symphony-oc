@@ -56,7 +56,8 @@ PROMPT_TEMPLATE = Template("""你是 OpenCode Agent，正在处理一个来自 I
 2. 实现 Issue 描述的功能
 3. 确保 CI 命令 "{{ ci_command }}" 通过
 4. **不要** 执行 git push / git reset --hard / git rebase / git checkout（agent 权限已 deny）
-5. 完成后退出，不要进入交互模式
+5. 修改后执行 `git add` 和 `git commit -s` 提交变更（`-s` 自动添加 Signed-off-by）
+6. 完成后退出，不要进入交互模式
 """)
 
 
@@ -77,15 +78,28 @@ def dispatch(issue: Issue, cfg) -> Run | None:
         run_bash(f"git fetch {cfg.git.remote}")
         run_bash(f"git worktree add -b {branch} {wt_path} {cfg.git.base_branch}")
 
+        # Set git identity in worktree so `git commit -s` adds correct Signed-off-by
+        name = run_bash("git config user.name", check=False).stdout.strip()
+        email = run_bash("git config user.email", check=False).stdout.strip()
+        if name:
+            run_bash(f"git config user.name {shlex.quote(name)}", cwd=wt_path)
+        if email:
+            run_bash(f"git config user.email {shlex.quote(email)}", cwd=wt_path)
+
         prompt = generate_prompt(issue, cfg.ci.command)
         Path(prompt_path).write_text(prompt)
+        # Copy prompt into worktree so the agent can read it (permissions restrict external paths)
+        wt_prompt_dir = Path(wt_path) / ".san/skills"
+        wt_prompt_dir.mkdir(parents=True, exist_ok=True)
+        wt_prompt = wt_prompt_dir / f"{slugify(issue.title)}.md"
+        wt_prompt.write_text(prompt)
 
         cmd = [
             "opencode", "run",
             "--agent", cfg.agent.name,
             "--dir", wt_path,
             *cfg.agent.extra_args,
-            prompt,
+            str(wt_prompt),
         ]
         proc = subprocess.Popen(
             cmd,

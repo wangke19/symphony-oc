@@ -14,6 +14,8 @@ permission:
   grep: allow
   bash:
     "*": ask
+    "go build *": allow
+    "go vet *": allow
     "pytest *": allow
     "go test *": allow
     "make *": allow

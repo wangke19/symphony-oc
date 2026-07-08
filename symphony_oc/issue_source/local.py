@@ -7,20 +7,17 @@ from symphony_oc.issue_source import Issue
 class LocalIssueSource:
     def __init__(self, issues_dir: str = "./issues"):
         self._dir = Path(issues_dir)
-        self._counter = 0
 
     def fetch_issues(self) -> list[Issue]:
         if not self._dir.exists():
             return []
         issues = []
-        for f in sorted(self._dir.iterdir()):
-            if not f.name.endswith(".md"):
-                continue
+        md_files = [f for f in sorted(self._dir.iterdir()) if f.name.endswith(".md")]
+        for idx, f in enumerate(md_files, start=1):
             content = f.read_text()
             title, labels, body = self._parse(content, f.stem)
-            self._counter += 1
             issue = Issue(
-                id=f"local-{self._counter:04d}",
+                id=f"local-{idx:04d}",
                 title=title,
                 description=body,
                 labels=labels,

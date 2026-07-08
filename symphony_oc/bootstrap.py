@@ -1,6 +1,9 @@
 """Pre-flight checks + agent install. Idempotent. Safe to re-run."""
 
 import hashlib
+import json
+import os
+import re
 import shutil
 import subprocess
 import sys
@@ -8,9 +11,12 @@ from pathlib import Path
 
 MIN_OPENCODE_VERSION = (1, 17, 7)
 AGENT_NAME = "symphony-worker"
+REVIEWER_NAME = "symphony-reviewer"
 AGENT_INSTALL_DIR = Path.home() / ".config/opencode/agents"
 AGENT_INSTALL_PATH = AGENT_INSTALL_DIR / f"{AGENT_NAME}.md"
+REVIEWER_INSTALL_PATH = AGENT_INSTALL_DIR / f"{REVIEWER_NAME}.md"
 BUNDLED_AGENT = Path(__file__).parent.parent / "agents" / f"{AGENT_NAME}.md"
+BUNDLED_REVIEWER = Path(__file__).parent.parent / "agents" / f"{REVIEWER_NAME}.md"
 REPO_ROOT = Path(__file__).parent.parent
 
 
@@ -20,23 +26,30 @@ class BootError(RuntimeError):
 
 def main() -> int:
     checks = [
-        check_opencode_version,
-        check_external_tools,
-        check_git_remote,
-        install_agent,
-        verify_agent_discoverable,
-        init_workspace,
-        smoke_test_agent,
+        ("check_opencode_version", check_opencode_version),
+        ("check_external_tools", check_external_tools),
+        ("check_git_remote", check_git_remote),
+        ("install_agent", install_agent),
+        ("install_reviewer_agent", install_reviewer_agent),
+        ("verify_agent_discoverable", verify_agent_discoverable),
+        ("verify_reviewer_discoverable", verify_reviewer_discoverable),
+        ("check_providers", check_providers),
+        ("init_workspace", init_workspace),
+        ("smoke_test_agent", smoke_test_agent),
     ]
-    for check in checks:
+    all_ok = True
+    for name, fn in checks:
         try:
-            check()
-            print(f"  ✓ {check.__name__}")
+            fn()
+            print(f"  ✓ {name}")
         except BootError as e:
-            print(f"  ✗ {check.__name__}: {e}", file=sys.stderr)
-            return 1
-    print("bootstrap complete")
-    return 0
+            print(f"  ✗ {name}: {e}", file=sys.stderr)
+            all_ok = False
+    if all_ok:
+        print("bootstrap complete")
+        return 0
+    print("bootstrap failed — fix issues and re-run", file=sys.stderr)
+    return 1
 
 
 def check_opencode_version() -> None:
@@ -75,17 +88,27 @@ def check_git_remote() -> None:
         )
 
 
-def install_agent() -> None:
-    """Copy bundled agents/symphony-worker.md → ~/.config/opencode/agents/.
-    Skip if installed copy's sha256 matches bundled file (idempotent)."""
-    bundled_hash = hashlib.sha256(BUNDLED_AGENT.read_bytes()).hexdigest()
+# ---------------------------------------------------------------------------
+# Agent install
+# ---------------------------------------------------------------------------
 
+def _install_agent(name: str, bundled: Path, installed: Path) -> None:
+    bundled_hash = hashlib.sha256(bundled.read_bytes()).hexdigest()
     AGENT_INSTALL_DIR.mkdir(parents=True, exist_ok=True)
-    if AGENT_INSTALL_PATH.exists():
-        installed_hash = hashlib.sha256(AGENT_INSTALL_PATH.read_bytes()).hexdigest()
+    if installed.exists():
+        installed_hash = hashlib.sha256(installed.read_bytes()).hexdigest()
         if installed_hash == bundled_hash:
             return
-    AGENT_INSTALL_PATH.write_bytes(BUNDLED_AGENT.read_bytes())
+    installed.write_bytes(bundled.read_bytes())
+
+
+def install_agent() -> None:
+    _install_agent(AGENT_NAME, BUNDLED_AGENT, AGENT_INSTALL_PATH)
+
+
+def install_reviewer_agent() -> None:
+    if BUNDLED_REVIEWER.exists():
+        _install_agent(REVIEWER_NAME, BUNDLED_REVIEWER, REVIEWER_INSTALL_PATH)
 
 
 def verify_agent_discoverable() -> None:
@@ -101,6 +124,93 @@ def verify_agent_discoverable() -> None:
             "Permission boundary would be bypassed — refusing to start."
         )
 
+
+def verify_reviewer_discoverable() -> None:
+    """Verify reviewer agent is discoverable (soft warning, not fatal)."""
+    if not BUNDLED_REVIEWER.exists():
+        print("  ⚠ agents/symphony-reviewer.md not bundled, skipping reviewer check")
+        return
+    out = subprocess.run(
+        ["opencode", "agent", "list"],
+        capture_output=True, text=True, check=True,
+    )
+    if REVIEWER_NAME not in out.stdout:
+        print(
+            "  ⚠ reviewer agent not installed — run `install_reviewer_agent()` or re-bootstrap"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Provider / API key checks
+# ---------------------------------------------------------------------------
+
+# Required providers and their env vars
+REQUIRED_PROVIDERS: dict[str, list[str]] = {
+    "anthropic": ["ANTHROPIC_API_KEY"],
+    "deepseek": ["DEEPSEEK_API_KEY"],
+    "bigmodel": ["BIGMODEL_API_KEY", "BIGMODEL_CODING_API_KEY"],
+}
+
+
+def check_providers() -> None:
+    """Check that LLM providers used by the orchestrator are available.
+
+    Checks two things:
+      1. Required env vars are set (export API_KEY=...)
+      2. opencode.jsonc has matching provider entries (if the file exists)
+
+    The orchestrator needs at minimum:
+      - A provider for the worker agent (e.g. deepseek, anthropic)
+      - bigmodel/coding provider for the reviewer agent
+    """
+    missing = []
+    for provider, env_vars in REQUIRED_PROVIDERS.items():
+        has_var = any(os.environ.get(var) for var in env_vars)
+        has_provider = _opencode_has_provider(provider)
+        if has_var or has_provider:
+            continue
+        # bigmodel is optional if reviewer features aren't used
+        if provider == "bigmodel":
+            print(
+                f"  ⚠ {provider}: set {' or '.join(env_vars)} env var "
+                "or configure in opencode.jsonc (needed for review loop)"
+            )
+            continue
+        missing.append(f"{provider} ({' or '.join(env_vars)})")
+
+    if missing:
+        raise BootError(
+            "missing provider config. Set one of these env vars:\n  "
+            + "\n  ".join(missing)
+            + "\nOr configure providers in ~/.config/opencode/opencode.jsonc"
+        )
+
+
+def _opencode_has_provider(provider_name: str) -> bool:
+    """Check if a provider is configured in opencode.jsonc."""
+    config_paths = [
+        Path.home() / ".config/opencode/opencode.jsonc",
+        REPO_ROOT / ".opencode.jsonc",
+    ]
+    for path in config_paths:
+        if not path.exists():
+            continue
+        try:
+            text = path.read_text()
+            text = re.sub(r"//.*", "", text)  # strip comments for JSONC
+            data = json.loads(text)
+        except (json.JSONDecodeError, OSError):
+            continue
+        # opencode.jsonc has providers at top level or under llm
+        providers = data.get("providers", data.get("llm", {}).get("providers", {}))
+        if provider_name in providers:
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Workspace init
+# ---------------------------------------------------------------------------
 
 def init_workspace() -> None:
     for d, ignore in [
@@ -119,6 +229,10 @@ def init_workspace() -> None:
     if not runs.exists():
         runs.write_text('{\n  "runs": [],\n  "last_poll": null\n}\n')
 
+
+# ---------------------------------------------------------------------------
+# Smoke test
+# ---------------------------------------------------------------------------
 
 def smoke_test_agent() -> None:
     """Start opencode for 2s, scan output for 'not found' / 'Falling back'."""
@@ -142,7 +256,7 @@ def smoke_test_agent() -> None:
 
 def check_installed_agent_hash(bundled_path: str, installed_path: str) -> None:
     """Compare sha256 hash of bundled agent vs installed agent.
-    Raises RuntimeError if installed file not found or hashes mismatch."""
+    Raises RuntimeError if installed file not found or hashes differ."""
     bundled = Path(bundled_path)
     installed = Path(installed_path)
 
