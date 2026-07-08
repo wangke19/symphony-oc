@@ -192,18 +192,26 @@ def reconcile(run: Run, cfg) -> None:
         mark_failed(run, f"CI failed (exit {ci.returncode}): {ci.stderr[:500]}")
         return
 
-    # 4. Push the agent's commits
+    # 4. Two-commit split: infrastructure vs dependencies/generated artifacts
+    if cfg.git.two_commit_pr:
+        commit_selective(wt, f"feat: {run.title}", exclude=cfg.git.two_commit_exclude)
+        if has_pending_changes(wt):
+            commit_all(wt, "chore: update dependencies and generated artifacts")
+    else:
+        commit_all(wt, f"feat: {run.title}")
+
+    # 5. Push the agent's commits
     push_result = run_bash("git push -u origin HEAD", cwd=wt, shell=True)
     if push_result.returncode != 0:
         mark_failed(run, f"git push failed: {push_result.stderr[:500]}")
         return
 
-    # 5. Create PR
+    # 6. Create PR
     try:
         pr_url = create_pr(run, ci.stdout, cfg, target_branch=base)
     except Exception as exc:
         mark_failed(run, f"PR creation failed: {exc}")
         return
 
-    # 6. Success
+    # 7. Success
     mark_succeeded(run, pr_url=pr_url)

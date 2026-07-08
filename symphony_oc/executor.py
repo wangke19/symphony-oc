@@ -32,6 +32,7 @@ def should_dispatch(issue: Issue, runs: list[Run]) -> bool:
 
 
 import os
+import shlex
 import signal
 import subprocess
 from datetime import datetime
