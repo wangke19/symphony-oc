@@ -8,6 +8,36 @@ from typing import Optional
 
 
 @dataclass
+class ReviewRecord:
+    """单轮审查的完整记录 — 用于人工复盘。"""
+    iteration: int                              # 1-indexed 审查轮次
+    verdict: str                                # "PASS" | "FAIL"
+    timestamp: datetime                         # reviewer 自填时间戳（来自 JSON）
+    files_affected: list[str]                   # JSON 中的受影响文件列表
+    summary: str                                # JSON 中的概述
+    feedback: list[dict]                        # JSON 中的结构化问题列表
+    reviewer_pid: Optional[int] = None
+    reviewer_started_at: Optional[datetime] = None
+    reviewer_finished_at: Optional[datetime] = None
+    review_file: Optional[str] = None           # .san/review/review-{N}.json 路径
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "ReviewRecord":
+        """Tolerant constructor — ignores unknown keys (LLM may emit extras).
+
+        Used by both state._dict_to_run (loading persisted runs.jsonc)
+        and reviewer.parse_review_result (parsing reviewer's raw JSON).
+        Single source of truth for filter + datetime parsing.
+        """
+        known = set(cls.__dataclass_fields__)
+        filtered = {k: v for k, v in d.items() if k in known}
+        for key in ['timestamp', 'reviewer_started_at', 'reviewer_finished_at']:
+            if key in filtered and filtered[key]:
+                filtered[key] = datetime.fromisoformat(filtered[key])
+        return cls(**filtered)
+
+
+@dataclass
 class Issue:
     id: str
     title: str
@@ -32,6 +62,10 @@ class Run:
     next_retry_at: Optional[datetime] = None
     started_at: datetime = field(default_factory=datetime.now)
     finished_at: Optional[datetime] = None
+    review_count: int = 0
+    review_passed: bool = False
+    review_feedback: Optional[str] = None
+    review_history: list[ReviewRecord] = field(default_factory=list)
 
 
 def hash_issue(issue: Issue) -> str:
@@ -40,21 +74,30 @@ def hash_issue(issue: Issue) -> str:
 
 
 def _run_to_dict(run: Run) -> dict:
-    """Convert Run dataclass to dict for JSON serialization."""
+    """Convert Run dataclass to dict for JSON serialization.
+
+    asdict() recursively flattens nested dataclasses (ReviewRecord) to dicts,
+    so review_history becomes list[dict]. The loops then convert datetime
+    fields (top-level and nested) to ISO strings.
+    """
     d = asdict(run)
-    # Convert datetime objects to ISO strings
     for key, value in d.items():
         if isinstance(value, datetime):
             d[key] = value.isoformat()
+    for rec in d.get('review_history', []):
+        for key in ['timestamp', 'reviewer_started_at', 'reviewer_finished_at']:
+            if rec.get(key) and isinstance(rec[key], datetime):
+                rec[key] = rec[key].isoformat()
     return d
 
 
 def _dict_to_run(d: dict) -> Run:
     """Convert dict back to Run dataclass."""
-    # Convert ISO strings back to datetime objects
     for key in ['started_at', 'finished_at', 'next_retry_at']:
         if key in d and d[key]:
             d[key] = datetime.fromisoformat(d[key])
+    if 'review_history' in d and d['review_history']:
+        d['review_history'] = [ReviewRecord.from_dict(r) for r in d['review_history']]
     return Run(**d)
 
 

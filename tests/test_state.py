@@ -188,3 +188,89 @@ class TestRunHelpers:
         assert run.status == "succeeded"
         assert run.pr_url == pr_url
         assert run.finished_at is not None
+
+
+class TestReviewRecord:
+    def test_from_dict_filters_unknown_keys(self):
+        from symphony_oc.state import ReviewRecord
+        d = {
+            "iteration": 1,
+            "verdict": "PASS",
+            "timestamp": "2026-07-12T10:00:00",
+            "files_affected": ["foo.py"],
+            "summary": "OK",
+            "feedback": [],
+            "confidence": 0.95,         # extra — must be ignored
+            "reviewer_name": "claude",  # extra — must be ignored
+        }
+        rec = ReviewRecord.from_dict(d)
+        assert rec.iteration == 1
+        assert rec.verdict == "PASS"
+        assert rec.timestamp == datetime.fromisoformat("2026-07-12T10:00:00")
+        assert rec.reviewer_pid is None  # not in input
+
+    def test_from_dict_parses_nested_datetimes(self):
+        from symphony_oc.state import ReviewRecord
+        d = {
+            "iteration": 2,
+            "verdict": "FAIL",
+            "timestamp": "2026-07-12T10:00:00",
+            "files_affected": [],
+            "summary": "bad",
+            "feedback": [{"file": "a.py", "line": 1, "severity": "major",
+                          "issue": "x", "suggestion": "y"}],
+            "reviewer_started_at": "2026-07-12T09:55:00",
+            "reviewer_finished_at": "2026-07-12T10:00:00",
+        }
+        rec = ReviewRecord.from_dict(d)
+        assert rec.reviewer_started_at == datetime.fromisoformat("2026-07-12T09:55:00")
+        assert rec.reviewer_finished_at == datetime.fromisoformat("2026-07-12T10:00:00")
+
+
+class TestRunReviewFields:
+    def test_run_has_review_defaults(self):
+        run = Run(issue_id="x", title="t", branch="b", worktree="w",
+                  content_hash="h", status="running", attempt=1,
+                  started_at=datetime.now())
+        assert run.review_count == 0
+        assert run.review_passed is False
+        assert run.review_feedback is None
+        assert run.review_history == []
+
+    def test_run_with_review_roundtrip(self, tmp_path):
+        from symphony_oc.state import save_run_atomic, load_all, ReviewRecord
+        now = datetime.now()
+        run = Run(issue_id="x", title="t", branch="b", worktree="w",
+                  content_hash="h", status="succeeded", attempt=1,
+                  started_at=now, finished_at=now,
+                  review_count=3, review_passed=True, review_feedback=None,
+                  review_history=[
+                      ReviewRecord(iteration=1, verdict="PASS",
+                                   timestamp=now, files_affected=["a.py"],
+                                   summary="ok", feedback=[]),
+                  ])
+        path = tmp_path / "state.json"
+        save_run_atomic(str(path), [run])
+        loaded = load_all(str(path))
+        assert len(loaded) == 1
+        assert loaded[0].review_count == 3
+        assert loaded[0].review_passed is True
+        assert len(loaded[0].review_history) == 1
+        assert loaded[0].review_history[0].iteration == 1
+        assert loaded[0].review_history[0].verdict == "PASS"
+
+    def test_old_state_without_review_fields_loads(self, tmp_path):
+        """runs.jsonc written before this feature must still load."""
+        from symphony_oc.state import load_all
+        path = tmp_path / "old.json"
+        path.write_text(
+            '[{"issue_id": "x", "title": "t", "branch": "b", '
+            '"worktree": "w", "content_hash": "h", "status": "succeeded", '
+            '"attempt": 1, "pid": null, "error": null, "pr_url": null, '
+            '"next_retry_at": null, "started_at": "2026-07-12T10:00:00", '
+            '"finished_at": "2026-07-12T11:00:00"}]'
+        )
+        loaded = load_all(str(path))
+        assert len(loaded) == 1
+        assert loaded[0].review_count == 0  # default
+        assert loaded[0].review_history == []
