@@ -63,6 +63,32 @@ class ReviewRecord:
 - 前六个字段（iteration / verdict / timestamp / files_affected / summary / feedback）由 `reviewer.parse_review_result()` 从 JSON 文件解析得到。
 - 后四个字段（reviewer_pid / reviewer_started_at / reviewer_finished_at / review_file）由 orchestrator 的 `_on_reviewer_done()` 在 parse 之后、append 之前显式赋值——这些信息不在 reviewer 输出的 JSON 里，需从 `run` 状态派生（pid/started_at）或当前时刻（finished_at）。
 
+**容错构造（`ReviewRecord.from_dict`）：** LLM 输出的 JSON 经常带 schema 之外的字段（如 `"confidence": 0.95`、`"reviewer_name": "claude"`）。裸 `ReviewRecord(**d)` 会因 unexpected keyword argument 抛 `TypeError`，让一个无害的额外字段判了死刑。为此 dataclass 上挂一个 classmethod，过滤未知 key + 转 datetime：
+
+```python
+@dataclass
+class ReviewRecord:
+    # ... 字段同上 ...
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "ReviewRecord":
+        """Tolerant constructor — ignores unknown keys (LLM may emit extras).
+
+        Used by both:
+          - state._dict_to_review_record  (loading persisted runs.jsonc)
+          - reviewer.parse_review_result  (parsing reviewer's raw JSON output)
+        Single source of truth for filter + datetime parsing.
+        """
+        known = set(cls.__dataclass_fields__)
+        filtered = {k: v for k, v in d.items() if k in known}
+        for key in ['timestamp', 'reviewer_started_at', 'reviewer_finished_at']:
+            if key in filtered and filtered[key]:
+                filtered[key] = datetime.fromisoformat(filtered[key])
+        return cls(**filtered)
+```
+
+`_dict_to_review_record` 简化为一行：`return ReviewRecord.from_dict(d)`。`parse_review_result`（§5.1）构造 `record` 时同样必须用 `ReviewRecord.from_dict(raw_json)`，**不能**裸 `ReviewRecord(**raw_json)`。
+
 ### 3.2 `Run` 新增字段
 
 ```python
@@ -93,15 +119,12 @@ def _dict_to_run(d: dict) -> Run:
         if key in d and d[key]:
             d[key] = datetime.fromisoformat(d[key])
     if 'review_history' in d and d['review_history']:
-        d['review_history'] = [_dict_to_review_record(r) for r in d['review_history']]
+        d['review_history'] = [ReviewRecord.from_dict(r) for r in d['review_history']]
     return Run(**d)
 
 
-def _dict_to_review_record(d: dict) -> ReviewRecord:
-    for key in ['timestamp', 'reviewer_started_at', 'reviewer_finished_at']:
-        if key in d and d[key]:
-            d[key] = datetime.fromisoformat(d[key])
-    return ReviewRecord(**d)
+# _dict_to_review_record 不再需要 — ReviewRecord.from_dict 直接处理
+# （既负责过滤未知 key，又负责 datetime 解析）
 
 
 def _run_to_dict(run: Run) -> dict:
@@ -246,6 +269,11 @@ def dispatch_fix(run: Run, cfg, review_feedback: str) -> None:
 
 def parse_review_result(wt_path: str, iteration: int) -> ReviewResult:
     """读取 .san/review/review-{iteration}.json，验证并返回 ReviewResult。
+    
+    成功路径构造 ReviewRecord 时必须用 `ReviewRecord.from_dict(raw_json)`，
+    **不能**裸 `ReviewRecord(**raw_json)` —— LLM 常在 schema 之外加字段
+    （如 "confidence"、"reviewer_name"），裸构造会 TypeError。from_dict
+    负责过滤未知 key + datetime 解析（与 state._dict_to_run 共享实现）。
     
     失败情况一律返回 ReviewResult(passed=False, ...)，不抛异常：
     - 文件不存在 → feedback="reviewer did not produce report"
@@ -619,8 +647,8 @@ def check_reviewer_model() -> None:
 
 | 测试文件 | 覆盖 |
 |---------|------|
-| `tests/test_state.py` (扩展) | `Run` 含新字段 round-trip JSONC；旧 JSONC 不含新字段时用默认值；`review_history` 嵌套 datetime 序列化往返 |
-| `tests/test_reviewer.py` (新) | `parse_review_result` 5 路径：valid PASS / valid FAIL / 文件缺失 / JSON parse 失败 / verdict 非法；`_format_feedback_text` 按 severity 排序 + 按文件分组 |
+| `tests/test_state.py` (扩展) | `Run` 含新字段 round-trip JSONC；旧 JSONC 不含新字段时用默认值；`review_history` 嵌套 datetime 序列化往返；**`ReviewRecord.from_dict` 过滤未知 key** |
+| `tests/test_reviewer.py` (新) | `parse_review_result` 5 路径：valid PASS / valid FAIL / 文件缺失 / JSON parse 失败 / verdict 非法；**reviewer 输出含 schema 之外字段（如 `"confidence": 0.95`）→ from_dict 过滤后正常构造**；`_format_feedback_text` 按 severity 排序 + 按文件分组 |
 | `tests/test_orchestrator.py` (扩展) | `_on_reviewer_done` 决策表 4 分支（PASS+N≥3 / PASS+N<3 / FAIL+N<5 / FAIL+N≥5）；**reconcile 异常 → schedule_retry 分支**；`_on_worker_done` dispatch_review 成功/失败；`process_completed` 路由（status=running / status=reviewing） |
 | `tests/test_agent_runner.py` (新) | `_spawn_agent`（mock `subprocess.Popen`）参数构造、log 路径、start_new_session=True |
 | `tests/test_executor.py` (扩展) | `dispatch()` 改为调 `_spawn_agent` 后行为不变 |
