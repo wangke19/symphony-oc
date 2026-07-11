@@ -49,7 +49,7 @@ class ReviewRecord:
     """单轮审查的完整记录 — 用于人工复盘。"""
     iteration: int                              # 1-indexed 审查轮次
     verdict: str                                # "PASS" | "FAIL"
-    timestamp: datetime                         # 审查完成时间
+    timestamp: datetime                         # reviewer 自填的 ISO 时间戳（来自 JSON）
     files_affected: list[str]                   # JSON 中的受影响文件列表
     summary: str                                # JSON 中的概述
     feedback: list[dict]                        # JSON 中的结构化问题列表
@@ -58,6 +58,10 @@ class ReviewRecord:
     reviewer_finished_at: Optional[datetime] = None
     review_file: Optional[str] = None           # .san/review/review-{N}.json 路径
 ```
+
+**字段填充责任分工：**
+- 前六个字段（iteration / verdict / timestamp / files_affected / summary / feedback）由 `reviewer.parse_review_result()` 从 JSON 文件解析得到。
+- 后四个字段（reviewer_pid / reviewer_started_at / reviewer_finished_at / review_file）由 orchestrator 的 `_on_reviewer_done()` 在 parse 之后、append 之前显式赋值——这些信息不在 reviewer 输出的 JSON 里，需从 `run` 状态派生（pid/started_at）或当前时刻（finished_at）。
 
 ### 3.2 `Run` 新增字段
 
@@ -146,11 +150,14 @@ permission:
   bash:
     "*": deny
     "git status": allow
-    "git diff *": allow
-    "git log *": allow
-    "git show *": allow
+    "git diff": allow
+    "git log": allow
+    "git show": allow
   external_directory: deny
   doom_loop: deny
+
+> **注（bash 匹配语义）：** 用 `"git diff": allow` 而非 `"git diff *": allow`。
+> opencode 的 bash 白名单做前缀匹配（与 `symphony-worker.md` 一致）—— `"git diff"` 匹配任意以 `git diff ` 开头的命令（含 `git diff upstream/main..HEAD`）。`*` 通配符的实际匹配规则在不同 opencode 版本下不一定一致，前缀形式更稳。
 ---
 
 你是 Symphony Reviewer Agent。你的任务是审查当前 worktree 内未合并到 base 的代码改动，
@@ -285,7 +292,50 @@ def parse_review_result(wt_path: str, iteration: int) -> ReviewResult:
 
 无 feedback items 时返回 `## 审查反馈摘要\n<summary>\n\n## 问题列表\n（无具体问题，但 verdict=FAIL）`。
 
-### 5.3 Fixer 复用 `symphony-worker`
+### 5.3 Prompt 模板策略
+
+**依赖确认：** `jinja2` 已是项目依赖（`executor.py:40` 已 `from jinja2 import Template`，现有 `dispatch()` 用 Jinja2 渲染 implementer prompt）。本 spec 不引入新依赖。
+
+**加载策略：** 与 `executor.py` 一致 —— **inline 模块级常量 + `Template()` 构造**，不引入 `FileSystemLoader` / 模板目录。理由：
+1. 现有代码已经是 inline 风格（`PROMPT_TEMPLATE = Template("""...""")`），保持一致
+2. 模板内容简短（review/fix prompt 各 ~30 行），独立文件开销不划算
+3. 避免 opencode agent 沙箱对外部模板目录的读取限制
+
+```python
+# reviewer.py
+from jinja2 import Template
+
+REVIEW_PROMPT_TEMPLATE = Template("""你是 Symphony Reviewer Agent。
+...（生成审查指令，含 issue 上下文、base_ref、上轮反馈、iteration N）...
+""")
+
+FIX_PROMPT_TEMPLATE = Template("""你是 Symphony Worker Agent（fixer 角色）。
+...（生成修复指令，含 issue 上下文、审查反馈）...
+""")
+
+
+def _build_review_prompt(run, base_ref, previous_feedback, iteration) -> str:
+    return REVIEW_PROMPT_TEMPLATE.render(
+        run=run, base_ref=base_ref,
+        previous_feedback=previous_feedback or "（首轮，无前次反馈）",
+        iteration=iteration,
+    )
+
+
+def _build_fix_prompt(run, feedback_text) -> str:
+    return FIX_PROMPT_TEMPLATE.render(
+        run=run, feedback_text=feedback_text,
+        branch=run.branch,
+    )
+```
+
+**模板变量约定：**
+- review prompt：`run`、`base_ref`、`previous_feedback`（str | "（首轮…）"占位）、`iteration`（int）
+- fix prompt：`run`、`feedback_text`（多行文本，由 `_format_feedback_text` 生成）、`branch`
+
+模板内容具体措辞在实现时定稿，spec 不固定字面字符串（避免实现期需要微调时还要改 spec）。
+
+### 5.4 Fixer 复用 `symphony-worker`
 
 不新建 fixer agent。fixer 是 `symphony-worker` + 不同 prompt（带审查反馈）。同一个 agent 文件，不同的 prompt 文件。
 
@@ -369,6 +419,13 @@ def _on_worker_done(run: Run, cfg) -> None:
 ```python
 def _on_reviewer_done(run: Run, cfg) -> None:
     iteration = run.review_count + 1
+    # Capture reviewer process info now — parse_review_result only reads the JSON
+    # file and can't know pid/timing. Must capture BEFORE any dispatch_* call
+    # below overwrites run.pid and run.started_at.
+    reviewer_pid = run.pid
+    reviewer_started_at = run.started_at
+    reviewer_finished_at = datetime.now()
+    
     try:
         result = parse_review_result(run.worktree, iteration)
     except Exception as e:
@@ -377,11 +434,18 @@ def _on_reviewer_done(run: Run, cfg) -> None:
         mark_failed(run, f"parse_review_result crash: {e}")
         return
     
+    # Populate process/timing fields that parse_review_result can't derive
+    # from the JSON file alone.
+    result.record.reviewer_pid = reviewer_pid
+    result.record.reviewer_started_at = reviewer_started_at
+    result.record.reviewer_finished_at = reviewer_finished_at
+    result.record.review_file = f"{run.worktree}/.san/review/review-{iteration}.json"
+    
     run.review_history.append(result.record)
     run.review_count = iteration
     run.review_passed = result.passed
     run.review_feedback = result.feedback_text
-    
+
     min_iter = cfg.agent.reviewer.min_iterations   # 默认 3
     max_iter = cfg.agent.reviewer.max_iterations   # 默认 5
     
@@ -508,10 +572,12 @@ def check_reviewer_model() -> None:
     
     # Soft warning
     args = cfg.agent.reviewer.extra_args
-    if any(a == "--model" for i, a in enumerate(args) for _ in [0] if i + 1 < len(args)):
-        return  # 已显式指定 --model <value>
-    if "--model" in args:
-        return
+    try:
+        idx = args.index("--model")
+        if idx + 1 < len(args):
+            return  # 已显式指定 --model <value>
+    except ValueError:
+        pass
     
     available = _list_opencode_models()
     if available:
@@ -565,8 +631,9 @@ def check_reviewer_model() -> None:
 
 | 场景 | 步骤 |
 |------|------|
-| 正常 3 轮 PASS | implementer → reviewer(PASS,N=1) → reviewer(PASS,N=2) → reviewer(PASS,N=3) → reconcile(succeeded) |
-| 中间 FAIL 后修复 | implementer → reviewer(FAIL,N=1) → fixer → reviewer(FAIL,N=2) → fixer → reviewer(PASS,N=3) → reconcile |
+| 正常 3 轮 PASS（无修复） | implementer → reviewer(PASS,N=1) → reviewer(PASS,N=2) → reviewer(PASS,N=3) → reconcile(succeeded) |
+| 中间 FAIL 后修复再 FAIL 再修复 | implementer → reviewer(FAIL,N=1) → fixer → reviewer(FAIL,N=2) → fixer → reviewer(PASS,N=3) → reconcile |
+| **修复后直接 PASS + 一致性审查** | implementer → reviewer(FAIL,N=1) → fixer → reviewer(PASS,N=2) → reviewer(PASS,N=3) → reconcile。验证 PASS<N<min 时走 re-review（不是 fixer），且第 3 轮 PASS 后 review_history 内有 3 条记录 |
 | 5 轮全 FAIL | implementer → reviewer(FAIL×5) → mark_failed |
 | Reviewer 写坏 JSON | implementer → reviewer(坏 JSON,N=1) → ... → N=5 mark_failed |
 | dispatch_review 抛异常 | implementer 完成 → dispatch_review 抛 → mark_failed |
@@ -578,7 +645,7 @@ def check_reviewer_model() -> None:
 - `state/runs.jsonc` → `runs[].review_history`（结构化，含所有审查轮次）
 - `worktrees/{issue_id}/.san/review/review-{N}.json`（reviewer 原始输出）
 - `log/{issue_id}.review-{N}.log`（reviewer 子进程 stdout/stderr）
-- `log/{issue_id}.fix-{N}.log`（fixer 子进程 stdout/stderr）
+- `log/{issue_id}.review-{N}-fix.log`（fixer 子进程 stdout/stderr，N = 触发此修复的 FAIL 审查轮次）
 
 `jq` 查询示例：
 ```bash
