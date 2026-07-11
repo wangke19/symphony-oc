@@ -13,6 +13,7 @@ from symphony_oc.subproc import interrupt_process
 from symphony_oc.executor import dispatch
 from symphony_oc.reconciler import reconcile
 from symphony_oc.issue_source.local import LocalIssueSource
+from symphony_oc.reviewer import dispatch_review, dispatch_fix, parse_review_result
 
 
 def retry_delay(attempt: int, backoff_ms: int = 10_000, max_backoff_ms: int = 60_000) -> int:
@@ -151,22 +152,92 @@ logger = logging.getLogger("symphony-oc")
 
 
 def process_completed(runs: list[Run], cfg) -> None:
-    """Detect completed agents (dead PID, status running) and reconcile.
+    """Detect completed agents (dead PID) and route to next phase.
 
-    If the agent process has exited and the run is still marked as running,
-    attempt the reconcile cycle (CI, push, PR). The run is updated in-place.
+    - status='running'   → _on_worker_done (launch reviewer)
+    - status='reviewing' → _on_reviewer_done (parse JSON + decide)
     """
     for run in runs:
-        if run.status != "running":
+        if run.status not in ("running", "reviewing"):
             continue
         if _pid_exists_simple(run.pid):
-            continue
-        logger.info("agent completed: %s (pid %s)", run.issue_id, run.pid)
+            continue  # agent still alive
+        logger.info("agent completed: %s (status=%s, pid=%s)",
+                    run.issue_id, run.status, run.pid)
+        if run.status == "running":
+            _on_worker_done(run, cfg)
+        else:  # reviewing
+            _on_reviewer_done(run, cfg)
+
+
+def _on_worker_done(run: Run, cfg) -> None:
+    """Worker (implementer or fixer) exited → dispatch reviewer."""
+    try:
+        dispatch_review(run, cfg, cfg.git.base_branch, run.review_feedback)
+    except Exception as e:
+        logger.exception("dispatch_review failed for %s: %s", run.issue_id, e)
+        mark_failed(run, f"dispatch_review error: {e}")
+
+
+def _on_reviewer_done(run: Run, cfg) -> None:
+    """Reviewer exited → parse JSON, append record, route by decision table."""
+    iteration = run.review_count + 1
+    # Capture reviewer process info BEFORE parse / dispatch overwrites run.
+    reviewer_pid = run.pid
+    reviewer_started_at = run.started_at
+    reviewer_finished_at = datetime.now()
+
+    try:
+        result = parse_review_result(run.worktree, iteration)
+    except Exception as e:
+        logger.exception("parse_review_result crashed for %s: %s", run.issue_id, e)
+        mark_failed(run, f"parse_review_result crash: {e}")
+        return
+
+    # Fields parse_review_result cannot derive from the JSON file alone.
+    result.record.reviewer_pid = reviewer_pid
+    result.record.reviewer_started_at = reviewer_started_at
+    result.record.reviewer_finished_at = reviewer_finished_at
+    result.record.review_file = f"{run.worktree}/.san/review/review-{iteration}.json"
+
+    run.review_history.append(result.record)
+    run.review_count = iteration
+    run.review_passed = result.passed
+    run.review_feedback = result.feedback_text
+
+    min_iter = cfg.agent.reviewer.min_iterations
+    max_iter = cfg.agent.reviewer.max_iterations
+
+    if result.passed and iteration >= min_iter:
+        logger.info("%s: review PASS iter=%d >= min=%d → reconcile",
+                    run.issue_id, iteration, min_iter)
         try:
             reconcile(run, cfg)
         except Exception as e:
-            logger.exception("reconcile failed for %s: %s", run.issue_id, e)
-            schedule_retry(run, f"reconcile error: {e}", backoff_ms=retry_delay(run.attempt))
+            logger.exception("%s: reconcile failed, scheduling retry", run.issue_id)
+            schedule_retry(run, f"reconcile error: {e}",
+                           backoff_ms=retry_delay(run.attempt))
+    elif result.passed:  # iteration < min_iter
+        logger.info("%s: review PASS iter=%d < min=%d → re-review",
+                    run.issue_id, iteration, min_iter)
+        try:
+            dispatch_review(run, cfg, cfg.git.base_branch, run.review_feedback)
+        except Exception as e:
+            logger.exception("%s: re-review dispatch failed", run.issue_id)
+            mark_failed(run, f"re-review dispatch error: {e}")
+    elif iteration < max_iter:  # FAIL
+        logger.info("%s: review FAIL iter=%d < max=%d → dispatch fixer",
+                    run.issue_id, iteration, max_iter)
+        try:
+            dispatch_fix(run, cfg, run.review_feedback)
+        except Exception as e:
+            logger.exception("%s: dispatch_fix failed", run.issue_id)
+            mark_failed(run, f"dispatch_fix error: {e}")
+    else:  # FAIL + iteration >= max_iter
+        logger.info("%s: review FAIL iter=%d >= max=%d → mark_failed",
+                    run.issue_id, iteration, max_iter)
+        mark_failed(run, f"review failed after {iteration} iterations: "
+                          f"{result.feedback_text[:300]}")
 
 
 def main_loop(cfg) -> None:
