@@ -26,6 +26,15 @@ agent:
   max_retries: 3
   retry_backoff_ms: 10000
   extra_args: ["--pure"]
+  # reviewer:
+  #   name: "symphony-reviewer"
+  #   min_iterations: 3       # PASS 也必须满 3 轮（一致性检查）
+  #   max_iterations: 5       # FAIL 超 5 轮放弃
+  #   # extra_args: 推荐指定强模型：
+  #   #   ["--model", "anthropic/claude-opus"]   # Claude Opus
+  #   #   ["--model", "bigmodel/coding"]         # GLM 5.x
+  #   # 留空则用 opencode 默认模型（不推荐 — 审查应用强模型）
+  #   extra_args: []
 local_issue:
   retrigger: "hash"
 polling_interval_ms: 30000
