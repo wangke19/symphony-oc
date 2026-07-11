@@ -76,3 +76,48 @@ class TestConfig:
         wf.write_text("---\ninvalid: [unclosed\n---\n")
         with pytest.raises(ValueError, match="YAML"):
             load_config(str(wf))
+
+    def test_default_reviewer_when_absent(self, tmp_path: Path):
+        from symphony_oc.config import load_config
+        wf = tmp_path / "WF.md"
+        wf.write_text("---\nagent:\n  name: symphony-worker\n---\n")
+        cfg = load_config(wf)
+        assert cfg.agent.reviewer.name == "symphony-reviewer"
+        assert cfg.agent.reviewer.min_iterations == 3
+        assert cfg.agent.reviewer.max_iterations == 5
+        assert cfg.agent.reviewer.extra_args == []
+
+    def test_full_reviewer_node_parsed(self, tmp_path: Path):
+        from symphony_oc.config import load_config
+        wf = tmp_path / "WF.md"
+        wf.write_text(
+            "---\n"
+            "agent:\n"
+            "  name: symphony-worker\n"
+            "  reviewer:\n"
+            "    name: my-reviewer\n"
+            "    min_iterations: 2\n"
+            "    max_iterations: 4\n"
+            "    extra_args: [\"--model\", \"anthropic/claude-opus\"]\n"
+            "---\n"
+        )
+        cfg = load_config(wf)
+        assert cfg.agent.reviewer.name == "my-reviewer"
+        assert cfg.agent.reviewer.min_iterations == 2
+        assert cfg.agent.reviewer.max_iterations == 4
+        assert cfg.agent.reviewer.extra_args == ["--model", "anthropic/claude-opus"]
+
+    def test_partial_reviewer_node_uses_defaults(self, tmp_path: Path):
+        from symphony_oc.config import load_config
+        wf = tmp_path / "WF.md"
+        wf.write_text(
+            "---\n"
+            "agent:\n"
+            "  reviewer:\n"
+            "    min_iterations: 4\n"
+            "---\n"
+        )
+        cfg = load_config(wf)
+        assert cfg.agent.reviewer.min_iterations == 4
+        assert cfg.agent.reviewer.max_iterations == 5  # default
+        assert cfg.agent.reviewer.name == "symphony-reviewer"  # default

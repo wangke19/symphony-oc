@@ -33,6 +33,14 @@ class CiConfig:
 
 
 @dataclass
+class ReviewerConfig:
+    name: str = "symphony-reviewer"
+    min_iterations: int = 3
+    max_iterations: int = 5
+    extra_args: list[str] = field(default_factory=list)
+
+
+@dataclass
 class AgentConfig:
     name: str = "symphony-worker"
     max_concurrent: int = 3
@@ -40,6 +48,7 @@ class AgentConfig:
     max_retries: int = 3
     retry_backoff_ms: int = 10_000
     extra_args: list[str] = field(default_factory=lambda: ["--pure"])
+    reviewer: ReviewerConfig = field(default_factory=ReviewerConfig)
 
 
 @dataclass
@@ -90,6 +99,12 @@ def _dict_to_config(d: dict) -> Config:
     if "agent" in d:
         a = d["agent"]
         cfg.agent = AgentConfig(**{k: a.get(k, getattr(cfg.agent, k)) for k in ["name", "max_concurrent", "stall_timeout_ms", "max_retries", "retry_backoff_ms", "extra_args"]})
+        if "reviewer" in a:
+            r = a["reviewer"]
+            cfg.agent.reviewer = ReviewerConfig(**{
+                k: r.get(k, getattr(cfg.agent.reviewer, k))
+                for k in ["name", "min_iterations", "max_iterations", "extra_args"]
+            })
     if "local_issue" in d:
         cfg.local_issue.retrigger = d["local_issue"].get("retrigger", cfg.local_issue.retrigger)
     if "polling_interval_ms" in d:
