@@ -40,6 +40,7 @@ from pathlib import Path
 from jinja2 import Template
 from symphony_oc.state import Issue, Run, hash_issue
 from symphony_oc.subproc import run_bash
+from symphony_oc.agent_runner import _spawn_agent
 
 
 PROMPT_TEMPLATE = Template("""你是 OpenCode Agent，正在处理一个来自 Issue Tracker 的开发任务。
@@ -95,18 +96,12 @@ def dispatch(issue: Issue, cfg) -> Run | None:
         wt_prompt = wt_prompt_dir / f"{slugify(issue.title)}.md"
         wt_prompt.write_text(prompt)
 
-        cmd = [
-            "opencode", "run",
-            "--agent", cfg.agent.name,
-            "--dir", wt_path,
-            *cfg.agent.extra_args,
-            str(wt_prompt),
-        ]
-        proc = subprocess.Popen(
-            cmd,
-            start_new_session=True,
-            stdout=open(f"log/{issue.id}.log", "wb"),
-            stderr=subprocess.STDOUT,
+        proc = _spawn_agent(
+            agent=cfg.agent.name,
+            wt_path=wt_path,
+            extra_args=cfg.agent.extra_args,
+            prompt_path=str(wt_prompt),
+            log_path=f"log/{issue.id}.log",
         )
 
         run = Run(
