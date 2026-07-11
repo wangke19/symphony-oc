@@ -9,6 +9,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from symphony_oc.config import load_config
+
 MIN_OPENCODE_VERSION = (1, 17, 7)
 AGENT_NAME = "symphony-worker"
 REVIEWER_NAME = "symphony-reviewer"
@@ -35,6 +37,7 @@ def main() -> int:
         ("verify_reviewer_discoverable", verify_reviewer_discoverable),
         ("check_providers", check_providers),
         ("init_workspace", init_workspace),
+        ("check_reviewer_model", check_reviewer_model),
         ("smoke_test_agent", smoke_test_agent),
     ]
     all_ok = True
@@ -254,6 +257,31 @@ def smoke_test_agent() -> None:
         )
 
 
+def _list_opencode_models() -> list[str]:
+    """Best-effort scan of opencode config for available provider/model ids.
+
+    Returns [] if nothing parseable is found — caller treats as 'no providers'.
+    """
+    config_path = Path.home() / ".config/opencode/opencode.jsonc"
+    if not config_path.exists():
+        return []
+    try:
+        text = config_path.read_text()
+        text = re.sub(r"//.*", "", text)  # strip JSONC comments
+        data = json.loads(text)
+    except (json.JSONDecodeError, OSError):
+        return []
+    providers = data.get("providers", {})
+    out = []
+    for provider_name, provider_cfg in providers.items():
+        if isinstance(provider_cfg, dict):
+            models = provider_cfg.get("models", {})
+            if isinstance(models, dict):
+                for model_id in models:
+                    out.append(f"{provider_name}/{model_id}")
+    return out
+
+
 def check_installed_agent_hash(bundled_path: str, installed_path: str) -> None:
     """Compare sha256 hash of bundled agent vs installed agent.
     Raises RuntimeError if installed file not found or hashes differ."""
@@ -268,6 +296,41 @@ def check_installed_agent_hash(bundled_path: str, installed_path: str) -> None:
 
     if bundled_hash != installed_hash:
         raise RuntimeError("agent hash mismatch — bundled and installed differ")
+
+
+def check_reviewer_model() -> None:
+    """Validate reviewer config + warn about missing --model."""
+    cfg = load_config(REPO_ROOT / "WORKFLOW.md")
+
+    if cfg.agent.reviewer.min_iterations > cfg.agent.reviewer.max_iterations:
+        raise BootError(
+            f"agent.reviewer.min_iterations ({cfg.agent.reviewer.min_iterations}) "
+            f"> max_iterations ({cfg.agent.reviewer.max_iterations}). "
+            f"决策表无法收敛 — 请调整 WORKFLOW.md。"
+        )
+
+    args = cfg.agent.reviewer.extra_args
+    try:
+        idx = args.index("--model")
+        if idx + 1 < len(args):
+            return  # explicit --model <value>
+    except ValueError:
+        pass
+
+    available = _list_opencode_models()
+    if available:
+        preview = ", ".join(available[:5]) + (" ..." if len(available) > 5 else "")
+        print(
+            f"  ⚠ reviewer extra_args 未指定 --model。可用 provider/model: {preview}\n"
+            f"    建议在 WORKFLOW.md 的 agent.reviewer.extra_args 加 "
+            f"[\"--model\", \"<strong-model>\"]"
+        )
+    else:
+        print(
+            "  ⚠ reviewer extra_args 未指定 --model，且未在 ~/.config/opencode/opencode.jsonc "
+            "找到已配置 provider。审查将用 opencode 默认模型（可能偏弱）。"
+        )
+
 
 
 if __name__ == "__main__":

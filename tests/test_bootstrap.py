@@ -1,12 +1,86 @@
 import pytest
 from pathlib import Path
+from unittest.mock import patch
 from symphony_oc.bootstrap import (
+    BootError,
     check_opencode_version,
     check_external_tool,
     check_git_remote,
     check_installed_agent_hash,
     MIN_OPENCODE_VERSION,
+    check_reviewer_model,
+    _list_opencode_models,
 )
+
+
+class TestCheckReviewerModel:
+    def test_min_gt_max_raises_boot_error(self, tmp_path):
+        from types import SimpleNamespace
+
+        cfg = SimpleNamespace(
+            agent=SimpleNamespace(
+                reviewer=SimpleNamespace(
+                    min_iterations=5, max_iterations=3, extra_args=[],
+                ),
+            ),
+        )
+        with patch("symphony_oc.bootstrap.load_config", return_value=cfg):
+            with patch("symphony_oc.bootstrap.REPO_ROOT", tmp_path):
+                with patch("symphony_oc.bootstrap._list_opencode_models",
+                           return_value=[]):
+                    with pytest.raises(BootError):
+                        check_reviewer_model()
+
+    def test_min_eq_max_ok(self):
+        from types import SimpleNamespace
+
+        cfg = SimpleNamespace(
+            agent=SimpleNamespace(
+                reviewer=SimpleNamespace(
+                    min_iterations=3, max_iterations=3,
+                    extra_args=["--model", "x"],
+                ),
+            ),
+        )
+        with patch("symphony_oc.bootstrap.load_config", return_value=cfg):
+            with patch("symphony_oc.bootstrap._list_opencode_models",
+                       return_value=[]):
+                check_reviewer_model()  # must not raise
+
+    def test_missing_model_with_providers_warns_not_raises(self, capsys):
+        from types import SimpleNamespace
+
+        cfg = SimpleNamespace(
+            agent=SimpleNamespace(
+                reviewer=SimpleNamespace(
+                    min_iterations=3, max_iterations=5, extra_args=[],
+                ),
+            ),
+        )
+        with patch("symphony_oc.bootstrap.load_config", return_value=cfg):
+            with patch("symphony_oc.bootstrap._list_opencode_models",
+                       return_value=["anthropic/claude-opus", "bigmodel/coding"]):
+                check_reviewer_model()  # must not raise
+            captured = capsys.readouterr()
+            assert "未指定 --model" in captured.out
+
+    def test_model_flag_present_silent(self, capsys):
+        from types import SimpleNamespace
+
+        cfg = SimpleNamespace(
+            agent=SimpleNamespace(
+                reviewer=SimpleNamespace(
+                    min_iterations=3, max_iterations=5,
+                    extra_args=["--model", "anthropic/claude-opus"],
+                ),
+            ),
+        )
+        with patch("symphony_oc.bootstrap.load_config", return_value=cfg):
+            with patch("symphony_oc.bootstrap._list_opencode_models",
+                       return_value=["anthropic/claude-opus"]):
+                check_reviewer_model()
+            captured = capsys.readouterr()
+            assert "未指定 --model" not in captured.out
 
 
 class TestCheckOpenCodeVersion:
